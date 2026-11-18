@@ -1,6 +1,7 @@
 import { createProvider, type AuthContext, type ProviderEnv } from "@earendil-works/pi-ai";
 import { ALLOW_USAGE_CREDITS_ENV } from "./billing.ts";
-import { discoverClaudeModels, getClaudeStatus, LOGIN_HINT, POWERSHELL_ENV } from "./claude-cli.ts";
+import { discoverClaudeModels, getClaudeStatus, LOGIN_HINT } from "./claude-cli.ts";
+import { POWERSHELL_ENV } from "./launch.ts";
 import { API_ID, CLAUDE_CODE_MODELS, modelFromDiscovery, PROVIDER_ID } from "./model-catalog.ts";
 import { streamClaudeCode } from "./stream.ts";
 

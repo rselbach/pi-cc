@@ -1,7 +1,7 @@
 import type { Model } from "@earendil-works/pi-ai";
 import { getBuiltinModels } from "@earendil-works/pi-ai/providers/all";
 
-export const PROVIDER_ID = "claude-code";
+export const PROVIDER_ID = "pi-cc";
 export const API_ID = "claude-code-stream-json";
 
 export type ClaudeCodeModel = Model<typeof API_ID>;
@@ -126,7 +126,7 @@ function fallbackModel(info: DiscoveredClaudeModel, id: string): ClaudeCodeModel
   };
 }
 
-function fromBuiltin(info: DiscoveredClaudeModel, id: string, builtin: Model<"anthropic-messages">): ClaudeCodeModel {
+function fromBuiltin(id: string, builtin: Model<"anthropic-messages">): ClaudeCodeModel {
   const {
     api: _api,
     provider: _provider,
@@ -163,7 +163,7 @@ export function modelFromDiscovery(info: DiscoveredClaudeModel): ClaudeCodeModel
         ? builtin.thinkingLevelMap?.off !== null
         : info.supportsAdaptiveThinking !== true,
   );
-  return builtin ? fromBuiltin(info, id, builtin) : fallbackModel(info, id);
+  return builtin ? fromBuiltin(id, builtin) : fallbackModel(info, id);
 }
 
 export const CLAUDE_CODE_MODELS: ClaudeCodeModel[] = FALLBACK_DISCOVERY.map(modelFromDiscovery);
@@ -210,10 +210,4 @@ export function supportsNativeToolChanges(model: string): boolean {
     NATIVE_TOOL_CHANGES_BY_ID.get(canonical) ??
     BUILTIN_ANTHROPIC_MODELS[canonical]?.compat?.supportsMidConvoToolChanges === true
   );
-}
-
-export function modelForDiscoveredRoute(route: string, label?: string): ClaudeCodeModel | undefined {
-  const canonical = withoutContextSuffix(ALIASES[withoutContextSuffix(route)] ?? route);
-  const known = CLAUDE_CODE_MODELS.find((model) => model.id === canonical);
-  return known ? { ...known, name: label ? `${label} (Claude Code)` : known.name } : undefined;
 }

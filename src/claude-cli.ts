@@ -1,12 +1,21 @@
 import { createHash, randomUUID } from "node:crypto";
-import { constants as fsConstants, existsSync } from "node:fs";
-import { access, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { delimiter, dirname, extname, isAbsolute, join, resolve } from "node:path";
+import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createInterface } from "node:readline";
-import { spawn, type ChildProcess } from "node:child_process";
+import type { ChildProcess } from "node:child_process";
 import { registerSessionResourceCleanup } from "@earendil-works/pi-ai";
+import {
+  childExit,
+  configuredCommand,
+  envValue,
+  killProcessTree,
+  POWERSHELL_ENV,
+  resolveClaudeExecutable,
+  spawnCommand,
+} from "./launch.ts";
+import { deriveInitialSystemMessages, rewriteInitialRequest } from "./request-rewrite.ts";
 import { TurnRelay } from "./turn-relay.ts";
 import { UsageCreditsChargeError, usageCreditsAllowed, type RateLimitInfo } from "./billing.ts";
 import { envFlagEnabled } from "./env.ts";
@@ -25,15 +34,12 @@ export const INSTALL_HINT =
   "Claude Code is not installed. Install it with `npm install -g @anthropic-ai/claude-code` " +
   "or set PI_CLAUDE_CODE_COMMAND to the executable.";
 export const LOGIN_HINT = "Claude Code is installed but not logged in. Run `claude auth login` and try again.";
-/** Optional PowerShell host used to launch a configured `.ps1` Claude Code command. */
-export const POWERSHELL_ENV = "PI_CLAUDE_CODE_POWERSHELL";
 
 export interface ClaudeStatus {
   available: boolean;
   loggedIn: boolean;
   /** True when Claude Code reports a Claude Pro/Max-style subscription login. */
   subscription: boolean;
-  authMethod?: string;
   plan?: string;
   detail?: string;
   command?: string;
@@ -69,9 +75,7 @@ export interface RunClaudeInput {
 
 export interface RunClaudeOutput {
   message: NativeMessage;
-  result: NativeResult;
   usage: NativeUsage;
-  exitCode: number;
   relay: {
     upstreamRequests: number;
     blockedRequests: number;
@@ -80,75 +84,6 @@ export interface RunClaudeOutput {
   initialSystemMessages?: unknown[];
   /** Latest plan-limit status Claude Code reported for this turn. */
   rateLimit?: RateLimitInfo;
-}
-
-function configuredCommand(env: Record<string, string | undefined>): string {
-  return envValue(env, "PI_CLAUDE_CODE_COMMAND") || "claude";
-}
-
-/**
- * Read an environment entry. Windows environment blocks are case-insensitive
- * (`Path`, not `PATH`), and copying `process.env` into a plain object loses
- * Node's case-insensitive proxy, so look the name up case-insensitively there.
- */
-function envValue(env: Record<string, string | undefined>, name: string): string | undefined {
-  const direct = env[name];
-  if (direct !== undefined) return direct;
-  if (process.platform !== "win32") return undefined;
-  const key = Object.keys(env).find((candidate) => candidate.toLowerCase() === name.toLowerCase());
-  return key === undefined ? undefined : env[key];
-}
-
-async function executable(path: string): Promise<boolean> {
-  try {
-    await access(path, process.platform === "win32" ? fsConstants.F_OK : fsConstants.X_OK);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-/** Candidate paths for a command name, in the order Windows would resolve them. */
-function commandCandidates(command: string, env: Record<string, string | undefined>): string[] {
-  if (isAbsolute(command) || command.includes("/") || command.includes("\\")) return [resolve(command)];
-
-  const extensions =
-    process.platform === "win32"
-      ? (envValue(env, "PATHEXT") || ".COM;.EXE;.BAT;.CMD").split(";").flatMap((suffix) => [suffix, suffix.toLowerCase()])
-      : [""];
-  const candidates: string[] = [];
-  for (const directory of (envValue(env, "PATH") || "").split(delimiter)) {
-    if (!directory) continue;
-    for (const suffix of extensions) {
-      candidates.push(join(directory, process.platform === "win32" && extname(command) ? command : command + suffix));
-    }
-  }
-  return candidates;
-}
-
-export async function resolveClaudeExecutable(
-  env: Record<string, string | undefined> = process.env,
-): Promise<string | undefined> {
-  for (const candidate of commandCandidates(configuredCommand(env), env)) {
-    if (await executable(candidate)) return candidate;
-  }
-  return undefined;
-}
-
-/**
- * PowerShell host for a configured `.ps1` command. Noninteractive and
- * deterministic: an explicit override wins, then PowerShell 7 (`pwsh`) because
- * its native argument forwarding preserves embedded quotes, then the Windows
- * PowerShell that ships with every supported Windows release.
- */
-function resolvePowerShell(env: Record<string, string | undefined>): string {
-  const configured = envValue(env, POWERSHELL_ENV)?.trim();
-  if (configured) return configured;
-  for (const command of ["pwsh", "powershell"]) {
-    const candidate = commandCandidates(command, env).find((path) => existsSync(path));
-    if (candidate) return candidate;
-  }
-  return "powershell.exe";
 }
 
 function claudeEnvironment(env: Record<string, string | undefined>): Record<string, string> {
@@ -264,7 +199,6 @@ export async function getClaudeStatus(
     loggedIn,
     subscription: loggedIn && !!plan,
     command,
-    authMethod: typeof payload.authMethod === "string" ? payload.authMethod : undefined,
     plan,
     detail: loggedIn ? undefined : LOGIN_HINT,
   };
@@ -417,106 +351,6 @@ export async function discoverClaudeModels(
   }
 }
 
-// cmd.exe reparses the whole `/c` string, so tokens need cmd-level escaping in
-// addition to the quoting the receiving program's own command line parser
-// (CommandLineToArgvW) expects. The token rules below follow https://qntm.org/cmd.
-const CMD_META_CHARS = /([()\][%!^"`<>&|;, *?])/gu;
-
-function escapeCmdCommand(value: string): string {
-  return value.replace(CMD_META_CHARS, "^$1");
-}
-
-/** Quote one argument for a cmd.exe `/s /c` command line. Exported for tests. */
-export function escapeCmdArgument(value: string): string {
-  // Double backslashes that precede a quote, or that would precede the closing
-  // quote added below, so the child's parser restores them verbatim.
-  const quoted = `"${value.replace(/(?<!\\)(\\*)"/gu, '$1$1\\"').replace(/(?<!\\)(\\*)$/u, "$1$1")}"`;
-  return quoted.replace(CMD_META_CHARS, "^$1");
-}
-
-/** PowerShell single-quoted literal: everything is literal except `'`, which doubles. */
-function powershellLiteral(value: string): string {
-  return `'${value.replace(/'/gu, "''")}'`;
-}
-
-/**
- * Launch a configured `.ps1` Claude Code command through a noninteractive
- * PowerShell. The script text travels as `-EncodedCommand` so the Windows
- * command line parser never sees the scripts' arguments.
- */
-function spawnPowerShellScript(
-  command: string,
-  args: string[],
-  options: Parameters<typeof spawn>[2],
-): ChildProcess {
-  const shell = resolvePowerShell(options?.env ?? process.env);
-  // `-Command` collapses a script's exit code to 0 or 1, so forward it explicitly.
-  const script = [
-    [`& ${powershellLiteral(command)}`, ...args.map(powershellLiteral)].join(" "),
-    "$ok = $?",
-    "if ($LASTEXITCODE) { exit $LASTEXITCODE }",
-    "if (-not $ok) { exit 1 }",
-  ].join("; ");
-  const encoded = Buffer.from(script, "utf16le").toString("base64");
-  return spawn(
-    shell,
-    ["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-EncodedCommand", encoded],
-    options,
-  );
-}
-
-/**
- * Spawn Claude Code. `.cmd`/`.bat` shims need a cmd.exe command line that is
- * escaped once and passed verbatim; `.ps1` needs a PowerShell host. Native
- * executables (and every POSIX command) are spawned directly.
- */
-export function spawnCommand(
-  command: string,
-  args: string[],
-  options: Parameters<typeof spawn>[2],
-): ChildProcess {
-  if (process.platform !== "win32") return spawn(command, args, options);
-  if (/\.(?:cmd|bat)$/iu.test(command)) {
-    const comspec = envValue(options?.env ?? {}, "COMSPEC") || process.env.COMSPEC || "cmd.exe";
-    const line = `"${[escapeCmdCommand(command), ...args.map(escapeCmdArgument)].join(" ")}"`;
-    return spawn(comspec, ["/d", "/s", "/c", line], { ...options, windowsVerbatimArguments: true });
-  }
-  if (/\.ps1$/iu.test(command)) return spawnPowerShellScript(command, args, options);
-  return spawn(command, args, options);
-}
-
-function childExit(child: ChildProcess): Promise<number> {
-  return new Promise((resolve, reject) => {
-    child.once("error", reject);
-    child.once("exit", (code, signal) => {
-      if (code !== null) resolve(code);
-      else reject(new Error(`Claude Code exited from signal ${signal ?? "unknown"}`));
-    });
-  });
-}
-
-export function killProcessTree(child: ChildProcess): void {
-  if (child.exitCode !== null || child.pid === undefined) return;
-  if (process.platform === "win32") {
-    const killer = spawn("taskkill", ["/F", "/T", "/PID", String(child.pid)], {
-      stdio: "ignore",
-      windowsHide: true,
-    });
-    killer.once("error", () => child.kill());
-    killer.unref();
-    return;
-  }
-  try {
-    process.kill(-child.pid, "SIGKILL");
-  } catch {
-    try {
-      child.kill("SIGKILL");
-    } catch {
-      // It exited between the checks.
-    }
-  }
-}
-
 class AsyncQueue<T> {
   private readonly values: T[] = [];
   private readonly waiters: Array<(value: IteratorResult<T>) => void> = [];
@@ -629,7 +463,6 @@ async function writeFrame(child: ChildProcess, frame: NativeFrame): Promise<stri
   return uuid;
 }
 
-/** True when the result names user messages and this turn's frame is not one of them. */
 function resultIsForAnotherMessage(result: NativeResult, uuid: string): boolean {
   const ids = result.user_message_uuids;
   return Array.isArray(ids) && ids.length > 0 && !ids.includes(uuid);
@@ -642,258 +475,6 @@ function nativeErrorText(event: Extract<NativeOutputEvent, { type: "assistant" }
     .filter((block): block is Extract<(typeof event.message.content)[number], { type: "text" }> => block.type === "text")
     .map((block) => block.text)
     .join("\n");
-}
-
-function withoutCacheControl(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map(withoutCacheControl);
-  if (!value || typeof value !== "object") return value;
-  const output: Record<string, unknown> = {};
-  for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
-    if (key !== "cache_control") output[key] = withoutCacheControl(child);
-  }
-  return output;
-}
-
-interface NativeRequestMessage {
-  role?: string;
-  content?: unknown;
-}
-
-function requestMessages(body: Buffer | undefined): NativeRequestMessage[] | undefined {
-  if (!body) return undefined;
-  try {
-    const payload = JSON.parse(body.toString("utf8")) as { messages?: unknown };
-    return Array.isArray(payload.messages) ? (payload.messages as NativeRequestMessage[]) : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
-function deriveInitialSystemMessages(body: Buffer | undefined): unknown[] | undefined {
-  const messages = requestMessages(body);
-  if (messages?.[0]?.role !== "user") return undefined;
-  let end = 1;
-  while (messages[end]?.role === "system") end += 1;
-  const systems = messages.slice(1, end);
-
-  // A replayed history from an older carrier has the date reminder at the
-  // moving tail rather than in the initial environment reminder. Snapshot it
-  // beside the environment so the next request has a stable prefix.
-  let trailingStart = messages.length;
-  while (trailingStart > end && messages[trailingStart - 1]?.role === "system") trailingStart -= 1;
-  if (trailingStart < messages.length) systems.push(...messages.slice(trailingStart));
-  return systems.length ? structuredClone(systems) : undefined;
-}
-
-function contentText(content: unknown): string {
-  if (typeof content === "string") return content;
-  if (!Array.isArray(content)) return "";
-  return content
-    .map((block) =>
-      block && typeof block === "object" && typeof (block as Record<string, unknown>).text === "string"
-        ? ((block as Record<string, unknown>).text as string)
-        : "",
-    )
-    .join("");
-}
-
-function setCacheBreakpoint(message: NativeRequestMessage): void {
-  if (typeof message.content === "string") {
-    message.content = [
-      { type: "text", text: message.content, cache_control: { type: "ephemeral", ttl: "1h" } },
-    ];
-    return;
-  }
-  if (!Array.isArray(message.content) || message.content.length === 0) return;
-  const last = message.content.at(-1);
-  if (!last || typeof last !== "object") return;
-  // One breakpoint per message: Claude Code may already have marked an earlier
-  // block (e.g. a trailing date-reminder system message), and a second marker
-  // here would exceed Anthropic's four-breakpoint limit.
-  for (const block of message.content) {
-    if (block && typeof block === "object") delete (block as Record<string, unknown>).cache_control;
-  }
-  (last as Record<string, unknown>).cache_control = { type: "ephemeral", ttl: "1h" };
-}
-
-function setReplayCacheBreakpoints(messages: NativeRequestMessage[]): void {
-  const userIndexes = messages
-    .map((message, index) => (message.role === "user" ? index : -1))
-    .filter((index) => index >= 0);
-  if (userIndexes.length >= 3) {
-    // Claude permits four cache breakpoints. Its two system-prompt markers
-    // consume half of them, so once a prior queried user exists, move the
-    // native environment marker to that exact previous query boundary. This
-    // avoids relying on automatic lookback (notably unreliable with images).
-    for (const message of messages) {
-      if (message.role === "system") message.content = withoutCacheControl(message.content);
-    }
-    setCacheBreakpoint(messages[userIndexes.at(-2)!]!);
-  }
-  const final = messages.at(-1);
-  if (final) setCacheBreakpoint(final);
-}
-
-type ContentBlock = Record<string, unknown>;
-
-function isBlock(value: unknown): value is ContentBlock {
-  return !!value && typeof value === "object" && !Array.isArray(value);
-}
-
-/** Claude Code's note after an image it downscaled, mapping coordinates to the original. */
-function isImageScaleNote(block: unknown): boolean {
-  return (
-    isBlock(block) &&
-    block.type === "text" &&
-    typeof block.text === "string" &&
-    /^\[Image: original \d+x\d+/u.test(block.text)
-  );
-}
-
-/**
- * Rebuild native user content from Pi's canonical blocks. Claude Code adds
- * reminders (auto-memory, account context, attachments) to user messages and
- * appends them to tool-result text; none of that is Pi history. Canonical
- * blocks are matched in order to Claude Code's blocks by type, and anything
- * Claude Code added is dropped. Images are the exception: Claude Code may
- * downscale them and add a coordinate note, so its copies are kept.
- */
-function alignCanonicalContent(canonical: unknown[], wire: unknown[], where: string): unknown[] {
-  const output: unknown[] = [];
-  let cursor = 0;
-  for (const block of canonical) {
-    if (!isBlock(block)) throw new Error(`Claude Code request has an invalid canonical block in ${where}`);
-    const index = wire.findIndex(
-      (candidate, position) =>
-        position >= cursor &&
-        isBlock(candidate) &&
-        candidate.type === block.type &&
-        (block.type !== "tool_result" || candidate.tool_use_id === block.tool_use_id),
-    );
-    if (index < 0) throw new Error(`Claude Code request lost a ${String(block.type)} block in ${where}`);
-    const native = wire[index] as ContentBlock;
-    cursor = index + 1;
-
-    if (block.type === "image") {
-      output.push(withoutCacheControl(native));
-      if (isImageScaleNote(wire[cursor])) output.push(withoutCacheControl(wire[cursor++]));
-    } else if (block.type === "tool_result" && Array.isArray(block.content) && Array.isArray(native.content)) {
-      output.push({ ...structuredClone(block), content: alignCanonicalContent(block.content, native.content, where) });
-    } else {
-      output.push(structuredClone(block));
-    }
-  }
-  return output;
-}
-
-/** Replace every native user message's content with Pi's canonical content for it. */
-function restoreCanonicalUserContent(messages: NativeRequestMessage[], frames: NativeFrame[]): void {
-  const canonical = frames.filter((frame) => frame.type === "user");
-  const native = messages.filter((message) => message.role === "user");
-  if (native.length !== canonical.length) {
-    throw new Error(
-      `Claude Code request has ${native.length} user messages where Pi's history has ${canonical.length}`,
-    );
-  }
-  native.forEach((message, index) => {
-    const wire = Array.isArray(message.content)
-      ? message.content
-      : typeof message.content === "string"
-        ? [{ type: "text", text: message.content }]
-        : [];
-    // Keep Claude Code's breakpoint on this message even if it marked a dropped block.
-    const marker = (wire.findLast((block) => isBlock(block) && block.cache_control) as ContentBlock | undefined)
-      ?.cache_control;
-    const content = alignCanonicalContent(canonical[index]!.message.content, wire, `user message ${index}`);
-    if (marker && content.length) {
-      content[content.length - 1] = { ...(content.at(-1) as ContentBlock), cache_control: structuredClone(marker) };
-    }
-    message.content = content;
-  });
-}
-
-function injectNativeSystemMessages(
-  messages: NativeRequestMessage[],
-  injections: NativeSystemInjection[],
-): NativeRequestMessage[] {
-  const byAssistant = new Map<number, NativeRequestMessage[]>();
-  const trailing: NativeRequestMessage[] = [];
-  for (const injection of injections) {
-    const message = { role: "system", content: structuredClone(injection.content) };
-    if (injection.beforeAssistant === null) trailing.push(message);
-    else {
-      const pending = byAssistant.get(injection.beforeAssistant) ?? [];
-      pending.push(message);
-      byAssistant.set(injection.beforeAssistant, pending);
-    }
-  }
-
-  const output: NativeRequestMessage[] = [];
-  let assistantOrdinal = 0;
-  for (const message of messages) {
-    if (message.role === "assistant") {
-      output.push(...(byAssistant.get(assistantOrdinal) ?? []));
-      byAssistant.delete(assistantOrdinal);
-      assistantOrdinal += 1;
-    }
-    output.push(message);
-  }
-  if (byAssistant.size > 0) throw new Error("Claude Code request lost an assistant boundary needed by system history");
-  output.push(...trailing);
-  return output;
-}
-
-function normalizeLeadingSystemCache(system: unknown): void {
-  if (!Array.isArray(system)) return;
-  for (const block of system) {
-    if (block && typeof block === "object") delete (block as Record<string, unknown>).cache_control;
-  }
-  const last = system.at(-1);
-  if (last && typeof last === "object") {
-    (last as Record<string, unknown>).cache_control = { type: "ephemeral", ttl: "1h" };
-  }
-}
-
-export function rewriteInitialRequest(
-  body: Buffer,
-  frames: NativeFrame[],
-  initialSystemMessages: unknown[] | undefined,
-  nativeSystemInjections?: NativeSystemInjection[],
-): Buffer {
-  const payload = JSON.parse(body.toString("utf8")) as {
-    messages?: NativeRequestMessage[];
-    system?: unknown;
-  };
-  let messages = payload.messages;
-  const first = messages?.[0];
-  if (first?.role !== "user" || !Array.isArray(first.content)) {
-    throw new Error("Claude Code request is missing its initial user message");
-  }
-  if (messages) restoreCanonicalUserContent(messages, frames);
-
-  if (initialSystemMessages?.length && messages) {
-    let systemEnd = 1;
-    while (messages[systemEnd]?.role === "system") systemEnd += 1;
-    messages.splice(1, systemEnd - 1, ...(structuredClone(initialSystemMessages) as NativeRequestMessage[]));
-
-    const initialText = initialSystemMessages
-      .map((message) => contentText((message as NativeRequestMessage).content))
-      .join("\n");
-    while (messages.at(-1)?.role === "system") {
-      const trailingText = contentText(messages.at(-1)?.content);
-      if (!trailingText || !initialText.includes(trailingText)) break;
-      messages.pop();
-    }
-  }
-
-  if (nativeSystemInjections) {
-    messages = injectNativeSystemMessages(messages!, nativeSystemInjections);
-    payload.messages = messages;
-    normalizeLeadingSystemCache(payload.system);
-  }
-  if (initialSystemMessages?.length || nativeSystemInjections) setReplayCacheBreakpoints(messages!);
-
-  return Buffer.from(JSON.stringify(payload));
 }
 
 const CLAUDE_PROCESS_MAX_AGE_MS = 5 * 60 * 1_000;
@@ -1080,7 +661,6 @@ class ClaudeProcess {
       );
       return new ClaudeProcess(plan.fingerprint, root, child, relay, queue, readTask, exitOutcome, plan.timeoutMs);
     } catch (error) {
-      relay?.abort();
       if (child && child.exitCode === null) killProcessTree(child);
       await relay?.close();
       await rm(root, { recursive: true, force: true });
@@ -1131,7 +711,6 @@ class ClaudeProcess {
     return true;
   }
 
-  /** True once the current turn streamed output or reached the upstream API. */
   get startedOutput(): boolean {
     return this.delivered || this.relay.used;
   }
@@ -1153,82 +732,19 @@ class ClaudeProcess {
       input.betas,
     );
 
-    const abort = () => {
-      this.relay.abort();
-      this.closeNow();
-    };
+    const abort = () => this.closeNow();
     input.signal?.addEventListener("abort", abort, { once: true });
-    const assistants: NativeMessage[] = [];
-    let result: NativeResult | undefined;
-    let nativeError: string | undefined;
-    let turnUuid: string | undefined;
-    let rateLimit: RateLimitInfo | undefined;
 
     try {
-      const frames = continuation ? input.frames.slice(-1) : input.frames;
-      for (const frame of frames) {
-        const uuid = await writeFrame(this.child, frame);
-        if (frame.shouldQuery === false) {
-          for (;;) {
-            const event = await this.queue.next(input.signal, this.timeoutMs);
-            if (!event) throw await this.exitError("Claude Code exited before acknowledging history replay");
-            if (event.type === "result") {
-              if (event.num_turns !== 0 || event.is_error) {
-                throw new Error("Claude Code rejected zero-turn history replay");
-              }
-              break;
-            }
-          }
-        } else {
-          turnUuid = uuid;
-        }
-      }
-
-      for (;;) {
-        const event = await this.queue.next(input.signal, this.timeoutMs);
-        if (!event) throw await this.exitError("Claude Code exited before completing its response");
-        if (event.type === "assistant") {
-          const error = nativeErrorText(event);
-          if (error !== undefined) nativeError = error;
-          else assistants.push(event.message);
-        } else if (event.type === "result") {
-          // A late result from an earlier turn may still sit in the queue.
-          if (turnUuid && resultIsForAnotherMessage(event, turnUuid)) continue;
-          result = event;
-          break;
-        } else if (event.type === "rate_limit_event") {
-          if (event.rate_limit_info && typeof event.rate_limit_info === "object") rateLimit = event.rate_limit_info;
-        } else if (event.type === "stream_event" && !this.relay.used) {
-          deliver(event.event);
-        }
-      }
+      const turnUuid = await this.writeFrames(continuation ? input.frames.slice(-1) : input.frames, input.signal);
+      const { assistants, result, nativeError, rateLimit } = await this.collectTurn(input.signal, turnUuid, deliver);
       await this.relay.settled();
       input.signal?.throwIfAborted();
 
       let message: NativeMessage | undefined;
       if (this.relay.used) {
-        if (this.relay.status !== 200 || !this.relay.capture.complete || !this.relay.capture.message) {
-          let detail = `status ${this.relay.status ?? "unknown"}, capture ${this.relay.capture.complete ? "complete" : "incomplete"}`;
-          if (this.relay.failure) detail += `, relay failure ${this.relay.failure}`;
-          if (this.relay.denied) detail += `, native retries denied ${this.relay.denied}`;
-          const upstreamError = this.relay.errorText();
-          if (upstreamError) detail += `, upstream said: ${upstreamError.slice(0, 500)}`;
-          // Claude Code's native retries are off, so Pi's retry classifier is the
-          // only retry left. Word transient failures so it recognizes them.
-          if (this.relay.status === 200 && !this.relay.capture.complete && !upstreamError) {
-            // A dropped stream with no upstream error is a transport failure.
-            throw new Error(`Claude Code upstream stream ended before message_stop (${detail})`);
-          }
-          if (this.relay.status === undefined && this.relay.upstreamFailed) {
-            // The connection to Anthropic failed before any response status.
-            throw new Error(`Claude Code upstream connection lost before a response (${detail})`);
-          }
-          if (this.relay.status !== undefined && this.relay.status >= 500) {
-            // 5xx such as 529 (overloaded) are transient regardless of the body.
-            throw new Error(`Claude Code upstream server error (${detail})`);
-          }
-          throw new Error(`Incomplete Claude Code upstream response (${detail})`);
-        }
+        const failure = this.relay.responseError();
+        if (failure) throw failure;
         message = this.relay.capture.message;
         sawMessageStop = true;
       } else {
@@ -1237,7 +753,7 @@ class ClaudeProcess {
 
       // Native error assistants are not collected; report their text instead of "Incomplete".
       if (!message && nativeError) throw new Error(`Claude Code API error: ${nativeError}`);
-      if (!message || !sawMessageStop || !result) {
+      if (!message || !sawMessageStop) {
         throw new Error(
           `Incomplete Claude Code response: assistant, message_stop and one result required${this.stderr ? ` (${this.stderr.trim().slice(-500)})` : ""}`,
         );
@@ -1264,9 +780,7 @@ class ClaudeProcess {
 
       return {
         message,
-        result,
         usage,
-        exitCode: this.child.exitCode ?? 0,
         relay: {
           upstreamRequests: Number(this.relay.used),
           blockedRequests: this.relay.denied,
@@ -1282,6 +796,53 @@ class ClaudeProcess {
     }
   }
 
+  /** Writes the turn's frames, waiting out each zero-turn history replay, and returns the queried frame's uuid. */
+  private async writeFrames(frames: NativeFrame[], signal?: AbortSignal): Promise<string | undefined> {
+    let turnUuid: string | undefined;
+    for (const frame of frames) {
+      const uuid = await writeFrame(this.child, frame);
+      if (frame.shouldQuery !== false) {
+        turnUuid = uuid;
+        continue;
+      }
+      for (;;) {
+        const event = await this.queue.next(signal, this.timeoutMs);
+        if (!event) throw await this.exitError("Claude Code exited before acknowledging history replay");
+        if (event.type !== "result") continue;
+        if (event.num_turns !== 0 || event.is_error) throw new Error("Claude Code rejected zero-turn history replay");
+        break;
+      }
+    }
+    return turnUuid;
+  }
+
+  private async collectTurn(
+    signal: AbortSignal | undefined,
+    turnUuid: string | undefined,
+    deliver: (event: AnthropicStreamEvent) => void,
+  ) {
+    const assistants: NativeMessage[] = [];
+    let nativeError: string | undefined;
+    let rateLimit: RateLimitInfo | undefined;
+    for (;;) {
+      const event = await this.queue.next(signal, this.timeoutMs);
+      if (!event) throw await this.exitError("Claude Code exited before completing its response");
+      if (event.type === "assistant") {
+        const error = nativeErrorText(event);
+        if (error !== undefined) nativeError = error;
+        else assistants.push(event.message);
+      } else if (event.type === "result") {
+        // A late result from an earlier turn may still sit in the queue.
+        if (turnUuid && resultIsForAnotherMessage(event, turnUuid)) continue;
+        return { assistants, result: event, nativeError, rateLimit };
+      } else if (event.type === "rate_limit_event") {
+        if (event.rate_limit_info && typeof event.rate_limit_info === "object") rateLimit = event.rate_limit_info;
+      } else if (event.type === "stream_event" && !this.relay.used) {
+        deliver(event.event);
+      }
+    }
+  }
+
   async close(): Promise<void> {
     this.closeNow();
     await Promise.allSettled([this.readTask, this.exitOutcome, this.relay.close()]);
@@ -1292,7 +853,7 @@ class ClaudeProcess {
     if (this.closed) return;
     this.closed = true;
     this.clearExpiryTimer();
-    this.relay.abort();
+    this.relay.finishTurn();
     if (this.child.exitCode === null) killProcessTree(this.child);
   }
 
@@ -1335,7 +896,6 @@ async function expireProcess(sessionId: string, worker: ClaudeProcess): Promise<
   if (expired) await worker.close();
 }
 
-/** Drop a worker from the warm cache (if it is still there) and close it. */
 async function discardProcess(acquired: AcquiredProcess): Promise<void> {
   const { sessionId, worker } = acquired;
   if (sessionId && processCache.get(sessionId) === worker) {

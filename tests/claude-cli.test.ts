@@ -10,9 +10,9 @@ import {
   closeClaudeProcesses,
   discoverClaudeModels,
   getClaudeStatus,
-  rewriteInitialRequest,
   runClaudeRequest,
 } from "../src/claude-cli.ts";
+import { rewriteInitialRequest } from "../src/request-rewrite.ts";
 import type { NativeFrame } from "../src/native-types.ts";
 import { createClaudeCodeProvider } from "../src/provider.ts";
 
@@ -636,7 +636,6 @@ for await (const line of input) {
     assert.equal(common.env.ANTHROPIC_API_KEY === "pi-test-explicit-dummy", true);
     assert.equal(process.env.ANTHROPIC_API_KEY === "pi-test-dummy", true);
 
-    // A late result for another user message must not end the next warm turn.
     const warmTurns = async (sessionId: string, extra: Record<string, string>) => {
       const warm = { ...common, env: { ...common.env, ...extra }, sessionId };
       const one = await runClaudeRequest({ ...warm, frames: [userFrame("one")] });
@@ -650,19 +649,17 @@ for await (const line of input) {
       });
     };
     const foreign = await warmTurns("foreign-session", { STALE_RESULT: "foreign" });
-    assert.equal(foreign.message.id, "m_fake_2");
+    assert.equal(foreign.message.id, "m_fake_2", "a late result for another message does not end the warm turn");
     assert.equal((await readFile(processLog, "utf8")).trim().split("\n").length, 7);
 
-    // A stray result without a uuid fails the warm turn before any output, so
-    // it is replayed once on a fresh process.
     const bare = await warmTurns("bare-session", { STALE_RESULT: "bare" });
-    assert.equal(bare.message.id, "m_fake");
+    assert.equal(bare.message.id, "m_fake", "a stray result without a uuid replays once on a fresh process");
     assert.equal((await readFile(processLog, "utf8")).trim().split("\n").length, 9);
 
-    // A native error assistant reports its text, not an incomplete response.
     await assert.rejects(
       runClaudeRequest({ ...common, env: { ...common.env, NATIVE_ERROR: "1" }, frames: [userFrame("one")] }),
       /Claude Code API error: Usage limit/,
+      "a native error assistant reports its text",
     );
   } finally {
     if (originalApiKey === undefined) delete process.env.ANTHROPIC_API_KEY;

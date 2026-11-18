@@ -16,7 +16,7 @@ import {
   type TranscriptContext,
 } from "@earendil-works/pi-ai";
 import { describeUsageCreditsRejection, UsageCreditsChargeError, type RateLimitInfo } from "./billing.ts";
-import { runClaudeRequest } from "./claude-cli.ts";
+import { runClaudeRequest, type RunClaudeInput } from "./claude-cli.ts";
 import { nativeModel, supportsNativeToolChanges } from "./model-catalog.ts";
 import type { AnthropicStreamEvent, NativeContentBlock, NativeMessage, NativeUsage } from "./native-types.ts";
 import {
@@ -334,6 +334,39 @@ export function normalizeError(error: unknown): string {
   return message;
 }
 
+/** Build the Claude Code request for Pi's context. */
+function claudeRequest(
+  model: Model<any>,
+  sourceContext: TranscriptContext,
+  options?: SimpleStreamOptions,
+): Omit<RunClaudeInput, "onEvent"> {
+  const context = { ...sourceContext, messages: prepareMessages(sourceContext.messages, model) };
+  const nativeTranscript = prepareNativeTranscript(context.messages, supportsNativeToolChanges(model.id));
+  const transcript = nativeTranscript ? context : collapseSystemMessages(context);
+  const initialSystem = getInitialSystemMessage(transcript.messages);
+  const systemPrompt = nativeTranscript
+    ? initialSystem
+      ? getSystemMessageText(initialSystem)
+      : ""
+    : getCurrentSystemPrompt(transcript.messages);
+  const preparedTools = prepareTools(getCurrentTools(transcript.messages));
+  return {
+    model: nativeModel(model.id),
+    cwd: process.cwd(),
+    frames: prepareFrames(transcript.messages),
+    systemPrompt,
+    manifest: preparedTools.manifest,
+    extraBody: buildExtraBody(model, nativeTranscript?.requestTools ?? preparedTools.nativeTools, options),
+    signal: options?.signal,
+    timeoutMs: options?.timeoutMs,
+    env: options?.env,
+    initialSystemMessages: getInitialSystemMessages(transcript.messages),
+    nativeSystemInjections: nativeTranscript?.systemInjections,
+    betas: nativeTranscript ? [NATIVE_TOOL_CHANGES_BETA] : undefined,
+    sessionId: options?.cacheRetention === "none" ? undefined : options?.sessionId,
+  };
+}
+
 export function streamClaudeCode(
   model: Model<any>,
   sourceContext: TranscriptContext,
@@ -353,46 +386,10 @@ export function streamClaudeCode(
 
   void (async () => {
     try {
-      const context = { ...sourceContext, messages: prepareMessages(sourceContext.messages, model) };
-      const nativeTranscript = prepareNativeTranscript(
-        context.messages,
-        supportsNativeToolChanges(model.id),
-      );
-      const transcript = nativeTranscript ? context : collapseSystemMessages(context);
-      const initialSystem = getInitialSystemMessage(transcript.messages);
-      const systemPrompt = nativeTranscript
-        ? initialSystem
-          ? getSystemMessageText(initialSystem)
-          : ""
-        : getCurrentSystemPrompt(transcript.messages);
-      const tools = getCurrentTools(transcript.messages);
-      const frames = prepareFrames(transcript.messages);
-      const initialSystemMessages = getInitialSystemMessages(transcript.messages);
-      const preparedTools = prepareTools(tools);
-      const extraBody = buildExtraBody(
-        model,
-        nativeTranscript?.requestTools ?? preparedTools.nativeTools,
-        options,
-      );
+      const request = claudeRequest(model, sourceContext, options);
       const translator = new EventTranslator(model, output, stream);
-
       stream.push({ type: "start", partial: output });
-      const response = await runClaudeRequest({
-        model: nativeModel(model.id),
-        cwd: process.cwd(),
-        frames,
-        systemPrompt,
-        manifest: preparedTools.manifest,
-        extraBody,
-        signal: options?.signal,
-        timeoutMs: options?.timeoutMs,
-        env: options?.env,
-        initialSystemMessages,
-        nativeSystemInjections: nativeTranscript?.systemInjections,
-        betas: nativeTranscript ? [NATIVE_TOOL_CHANGES_BETA] : undefined,
-        sessionId: options?.cacheRetention === "none" ? undefined : options?.sessionId,
-        onEvent: (event) => translator.event(event),
-      });
+      const response = await runClaudeRequest({ ...request, onEvent: (event) => translator.event(event) });
       translator.finish(response.message, response.usage, response.initialSystemMessages);
       output.providerThinkingLevel = options?.reasoning;
       output.diagnostics = [

@@ -6,7 +6,7 @@ routing requests through the official CLI.
 ## Environment variables
 
 Set these in the environment Pi runs in, or as provider-scoped settings for
-the `claude-code` provider.
+the `pi-cc` provider.
 
 | Variable | Effect |
 | --- | --- |

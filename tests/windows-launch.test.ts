@@ -3,14 +3,8 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import {
-  captureProcess,
-  escapeCmdArgument,
-  getClaudeStatus,
-  INSTALL_HINT,
-  LOGIN_HINT,
-  runClaudeRequest,
-} from "../src/claude-cli.ts";
+import { captureProcess, getClaudeStatus, INSTALL_HINT, LOGIN_HINT, runClaudeRequest } from "../src/claude-cli.ts";
+import { escapeCmdArgument } from "../src/launch.ts";
 
 const win32 = process.platform === "win32";
 const skip = win32 ? false : "Windows-only launcher behavior";
@@ -125,7 +119,6 @@ test("launches a .ps1 script through PowerShell and preserves every argument", {
   // Default host resolution (PowerShell 7 when installed, else Windows PowerShell).
   await assertArguments(ps1, ARGUMENT_MATRIX);
 
-  // An explicitly configured host wins and works for both installed hosts.
   for (const host of ["powershell.exe", "pwsh"]) {
     let available = true;
     try {
@@ -192,30 +185,27 @@ test("reports a failed status process as a diagnostic, not as a logout", { skip 
   assert.equal(garbageStatus.diagnostic, true);
   assert.match(garbageStatus.detail ?? "", /not-json-at-all/u);
 
-  // A genuinely logged-out Claude Code is still reported as a login problem.
   const loggedOut = join(root, "logged-out.cmd");
   await writeFile(loggedOut, `@ECHO off\r\necho {"loggedIn":false}\r\nexit /b 1\r\n`, "utf8");
   const loggedOutStatus = await getClaudeStatus({ ...env, PI_CLAUDE_CODE_COMMAND: loggedOut });
   assert.equal(loggedOutStatus.loggedIn, false);
   assert.equal(loggedOutStatus.diagnostic, undefined);
-  assert.equal(loggedOutStatus.detail, LOGIN_HINT);
+  assert.equal(loggedOutStatus.detail, LOGIN_HINT, "a genuine logout is still a login problem");
 
-  // A shell that cannot be spawned is a diagnostic as well.
   const spawnFailure = await getClaudeStatus({
     ...env,
     PI_CLAUDE_CODE_COMMAND: crashing,
     COMSPEC: join(root, "missing cmd.exe"),
   });
   assert.equal(spawnFailure.loggedIn, false);
-  assert.equal(spawnFailure.diagnostic, true);
+  assert.equal(spawnFailure.diagnostic, true, "an unspawnable shell is a diagnostic");
   assert.match(spawnFailure.detail ?? "", /status check failed/iu);
 
-  // A command that does not exist is still an installation problem.
   const unspawnable = await getClaudeStatus({
     ...env,
     PI_CLAUDE_CODE_COMMAND: join(root, "missing.cmd"),
   });
-  assert.equal(unspawnable.available, false);
+  assert.equal(unspawnable.available, false, "a missing command is an installation problem");
   assert.equal(unspawnable.detail, INSTALL_HINT);
 });
 

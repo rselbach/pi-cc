@@ -20,6 +20,8 @@ test("loads an installed extension without local peer dependencies", async (t) =
   assert.equal(result.extensions[0].commands.has("claude-code-status"), true);
   const registrations = result.runtime.pendingNativeProviderRegistrations;
   assert.equal(registrations.length, 1);
-  assert.equal(registrations[0].provider.id, "claude-code");
-  assert.ok(registrations[0].provider.getModels().length > 0);
+  assert.equal(registrations[0].provider.id, "pi-cc");
+  const models = registrations[0].provider.getModels();
+  assert.ok(models.length > 0);
+  for (const model of models) assert.equal(model.provider, "pi-cc");
 });

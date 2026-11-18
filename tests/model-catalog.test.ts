@@ -39,6 +39,7 @@ test("maps discovered aliases to stable canonical Pi model ids", () => {
     supportsAdaptiveThinking: true,
   });
   assert.equal(opus.id, "claude-opus-5-5");
+  assert.equal(opus.provider, "pi-cc");
   assert.equal(opus.name, "Claude Opus 5.5");
   assert.equal(opus.contextWindow, 1_000_000);
   assert.deepEqual(opus.cost, { input: 4, output: 20, cacheRead: 0.2, cacheWrite: 5 });
@@ -59,5 +60,6 @@ test("maps discovered aliases to stable canonical Pi model ids", () => {
     description: "A newly available model",
   });
   assert.equal(future.id, "claude-future-1");
+  assert.equal(future.provider, "pi-cc");
   assert.equal(future.cost.input, 0);
 });

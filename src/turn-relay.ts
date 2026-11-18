@@ -2,11 +2,7 @@ import * as http from "node:http";
 import * as https from "node:https";
 import { randomBytes } from "node:crypto";
 import type { AddressInfo } from "node:net";
-import type { AnthropicStreamEvent, NativeContentBlock, NativeMessage } from "./native-types.ts";
-
-function copy<T>(value: T): T {
-  return structuredClone(value);
-}
+import type { AnthropicStreamEvent, NativeMessage } from "./native-types.ts";
 
 export class AnthropicCapture {
   message?: NativeMessage;
@@ -54,10 +50,10 @@ export class AnthropicCapture {
   private apply(event: AnthropicStreamEvent): void {
     switch (event.type) {
       case "message_start":
-        this.message = copy(event.message);
+        this.message = structuredClone(event.message);
         break;
       case "content_block_start":
-        if (this.message) this.message.content[event.index] = copy(event.content_block);
+        if (this.message) this.message.content[event.index] = structuredClone(event.content_block);
         break;
       case "content_block_delta": {
         const block = this.message?.content[event.index];
@@ -115,6 +111,23 @@ const STRIPPED_REQUEST_HEADERS = new Set([
 
 const STRIPPED_RESPONSE_HEADERS = new Set(["connection", "transfer-encoding", "server", "date"]);
 
+function copyHeaders(headers: http.IncomingHttpHeaders, stripped: Set<string>): http.OutgoingHttpHeaders {
+  const output: http.OutgoingHttpHeaders = {};
+  for (const [name, value] of Object.entries(headers)) {
+    if (!stripped.has(name.toLowerCase()) && value !== undefined) output[name] = value;
+  }
+  return output;
+}
+
+/** Claude Code's `anthropic-beta` values plus the relay's, each listed once. */
+function mergeBetas(existing: string | string[] | undefined, extra: string[]): string {
+  const values = (Array.isArray(existing) ? existing.join(",") : (existing ?? ""))
+    .split(",")
+    .map((value) => value.trim())
+    .filter(Boolean);
+  return [...new Set([...values, ...extra])].join(",");
+}
+
 /**
  * Describe a relay failure without losing what Node puts outside `message`:
  * connection errors carry their reason in `code`, and a connection attempt to
@@ -132,7 +145,7 @@ export function describeFailure(error: unknown): string {
 }
 
 export class TurnRelay {
-  capture: AnthropicCapture;
+  capture = new AnthropicCapture();
   used = false;
   denied = 0;
   status?: number;
@@ -142,7 +155,6 @@ export class TurnRelay {
   upstreamFailed = false;
   errorBody = Buffer.alloc(0);
   originalRequestBody?: Buffer;
-  requestBody?: Buffer;
 
   private readonly upstream: URL;
   private readonly prefix = `/turn/${randomBytes(32).toString("base64url")}`;
@@ -151,18 +163,11 @@ export class TurnRelay {
   private readonly active = new Set<Promise<void>>();
   private cancelled = false;
   private closed = false;
-  private baseUrl?: string;
   private transformRequest?: (body: Buffer) => Buffer;
   private requestBetas: string[] = [];
   private readonly timeoutMs: number;
 
-  constructor(
-    upstream = "https://api.anthropic.com",
-    timeoutMs = 180_000,
-    onEvent?: (event: AnthropicStreamEvent) => void,
-    transformRequest?: (body: Buffer) => Buffer,
-    requestBetas: string[] = [],
-  ) {
+  constructor(upstream = "https://api.anthropic.com", timeoutMs = 180_000) {
     this.timeoutMs = timeoutMs;
     this.upstream = new URL(upstream);
     const loopback = ["127.0.0.1", "::1", "localhost"].includes(this.upstream.hostname);
@@ -175,9 +180,6 @@ export class TurnRelay {
     ) {
       throw new Error("Claude Code upstream must be HTTPS or a loopback HTTP fixture");
     }
-    this.capture = new AnthropicCapture(onEvent);
-    this.transformRequest = transformRequest;
-    this.requestBetas = requestBetas;
     this.server = http.createServer((request, response) => {
       const operation = this.handle(request, response).finally(() => this.active.delete(operation));
       this.active.add(operation);
@@ -201,7 +203,6 @@ export class TurnRelay {
     this.upstreamFailed = false;
     this.errorBody = Buffer.alloc(0);
     this.originalRequestBody = undefined;
-    this.requestBody = undefined;
     this.transformRequest = transformRequest;
     this.requestBetas = requestBetas;
     this.cancelled = false;
@@ -226,8 +227,7 @@ export class TurnRelay {
       });
     });
     const address = this.server.address() as AddressInfo;
-    this.baseUrl = `http://127.0.0.1:${address.port}${this.prefix}`;
-    return this.baseUrl;
+    return `http://127.0.0.1:${address.port}${this.prefix}`;
   }
 
   errorText(): string {
@@ -241,8 +241,27 @@ export class TurnRelay {
     }
   }
 
-  abort(): void {
-    this.finishTurn();
+  /** This turn's upstream failure, worded for Pi's retry classifier, or undefined when the response completed. */
+  responseError(): Error | undefined {
+    if (this.status === 200 && this.capture.complete && this.capture.message) return undefined;
+    let detail = `status ${this.status ?? "unknown"}, capture ${this.capture.complete ? "complete" : "incomplete"}`;
+    if (this.failure) detail += `, relay failure ${this.failure}`;
+    if (this.denied) detail += `, native retries denied ${this.denied}`;
+    const upstreamError = this.errorText();
+    if (upstreamError) detail += `, upstream said: ${upstreamError.slice(0, 500)}`;
+    // Claude Code's native retries are off, so Pi's retry classifier is the
+    // only retry left. Word transient failures so it recognizes them.
+    if (this.status === 200 && !this.capture.complete && !upstreamError) {
+      return new Error(`Claude Code upstream stream ended before message_stop (${detail})`);
+    }
+    if (this.status === undefined && this.upstreamFailed) {
+      return new Error(`Claude Code upstream connection lost before a response (${detail})`);
+    }
+    if (this.status !== undefined && this.status >= 500) {
+      // 5xx such as 529 (overloaded) are transient regardless of the body.
+      return new Error(`Claude Code upstream server error (${detail})`);
+    }
+    return new Error(`Incomplete Claude Code upstream response (${detail})`);
   }
 
   async settled(): Promise<void> {
@@ -251,7 +270,7 @@ export class TurnRelay {
 
   async close(): Promise<void> {
     this.closed = true;
-    this.abort();
+    this.finishTurn();
     await new Promise<void>((resolve) => {
       if (!this.server.listening) return resolve();
       this.server.close(() => resolve());
@@ -286,25 +305,13 @@ export class TurnRelay {
       let body = await this.readBody(request);
       this.originalRequestBody = Buffer.from(body);
       if (this.transformRequest) body = this.transformRequest(body);
-      this.requestBody = Buffer.from(body);
       if (this.cancelled) return;
 
-      const headers: http.OutgoingHttpHeaders = {};
-      for (const [name, value] of Object.entries(request.headers)) {
-        if (!STRIPPED_REQUEST_HEADERS.has(name.toLowerCase()) && value !== undefined) headers[name] = value;
-      }
+      const headers = copyHeaders(request.headers, STRIPPED_REQUEST_HEADERS);
       headers["accept-encoding"] = "identity";
       headers["content-length"] = body.length;
       if (this.requestBetas.length > 0) {
-        const existing = Array.isArray(headers["anthropic-beta"])
-          ? headers["anthropic-beta"].join(",")
-          : String(headers["anthropic-beta"] ?? "");
-        headers["anthropic-beta"] = [
-          ...new Set([
-            ...existing.split(",").map((value) => value.trim()).filter(Boolean),
-            ...this.requestBetas,
-          ]),
-        ].join(",");
+        headers["anthropic-beta"] = mergeBetas(request.headers["anthropic-beta"], this.requestBetas);
       }
 
       const pathPrefix = this.upstream.pathname.replace(/\/$/u, "");
@@ -333,10 +340,7 @@ export class TurnRelay {
       this.requestId =
         String(upstreamResponse.headers["request-id"] ?? upstreamResponse.headers["x-request-id"] ?? "") || undefined;
 
-      const responseHeaders: http.OutgoingHttpHeaders = {};
-      for (const [name, value] of Object.entries(upstreamResponse.headers)) {
-        if (!STRIPPED_RESPONSE_HEADERS.has(name.toLowerCase()) && value !== undefined) responseHeaders[name] = value;
-      }
+      const responseHeaders = copyHeaders(upstreamResponse.headers, STRIPPED_RESPONSE_HEADERS);
       responseHeaders.connection = "close";
       response.writeHead(upstreamResponse.statusCode ?? 502, responseHeaders);
 
